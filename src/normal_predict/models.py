@@ -6,6 +6,7 @@ import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils import utils_pt as utils
 import torch.nn.functional as F
+#import time
 
 class Model(nn.Module):
     def __init__(self, in_features=6, out_features=1):
@@ -37,19 +38,20 @@ class Model(nn.Module):
 
 
 class LapDeepModel(nn.Module):
-    def __init__(self, in_features=3, out_features=1, layers=15, bnmode='', nofirstId=False, only_lap = False, bottleneck=False, **useless):
+    def __init__(self, in_features=3, out_features=1, num_hidden=128, layers=15, bnmode='', nofirstId=False, only_lap = False, bottleneck=False, **useless):
         super(LapDeepModel, self).__init__()
 
-        self.conv1 = utils.GraphConv1x1(in_features, 128, batch_norm='')
+        self.conv1 = utils.GraphConv1x1(in_features, num_hidden, batch_norm='')
         self.layer_num = layers
         self.firstL = None
         if nofirstId:
-            self.firstL = utils.LapResNet2_noId(128, bnmode)
+            self.firstL = utils.LapResNet2_noId(num_hidden, bnmode)
         if bottleneck:
+            assert 0
             assert layers==16
             self.bottleneck = [128, 128, 64, 64, 32, 32, 16,16, 16, 16, 32, 32, 64,64,128,128, 128]
         else:
-            self.bottleneck = [128]* (layers+1)
+            self.bottleneck = [num_hidden]* (layers+1)
         for i in range(self.layer_num):
             if i % 2 == 0 or only_lap:
                 module = _LapResNet2(self.bottleneck[i], self.bottleneck[i+1], bnmode)
@@ -59,7 +61,7 @@ class LapDeepModel(nn.Module):
 
         if bnmode is not None:
             bnmode += 'pre'
-        self.conv2 = utils.GraphConv1x1(128, out_features, batch_norm=bnmode)
+        self.conv2 = utils.GraphConv1x1(num_hidden, out_features, batch_norm=bnmode)
 
     def forward(self, L, mask, inputs, **kwargs):
 
@@ -67,6 +69,7 @@ class LapDeepModel(nn.Module):
         x = self.conv1(inputs)
 
         if self.firstL is not None:
+            assert(0)
             x = self.firstL(L, mask, x)
         for i in range(self.layer_num):
             x = self._modules['rn{}'.format(i)](L, mask, x)
@@ -434,7 +437,8 @@ class _AvgResNet2(nn.Module):
         x = inputs
         for i in range(self.layer):
             x = F.elu(x)
-            xs = [x, utils.global_average(x, mask).expand_as(x).contiguous()]
+            global_avg = utils.global_average(x, mask)
+            xs = [x, global_avg.expand_as(x).contiguous()]
             x = torch.cat(xs, 2)
             x = self._modules[f'bn_fc{i}'](x)
 
@@ -464,6 +468,7 @@ class _LapResNet2(nn.Module):
         for i in range(self.layer):
             x = F.elu(x)
             if (L.layout) is torch.strided:
+                assert 0
                 xs = [x, torch.bmm(L,x)]
             else:
                 batch, node, feat = x.size()
@@ -613,7 +618,8 @@ def repeating_expand(inputs, out_features):
     _, _, in_features = inputs.size()
     times = out_features // in_features
     remin = out_features % in_features
-    expanded_input = torch.cat([inputs]*times + [inputs[:,:,:remin]],dim=2)
+    concat_inputs = [inputs]*times + [inputs[:,:,:remin]]
+    expanded_input = torch.cat(concat_inputs,dim=2)
     return expanded_input
 
 class GlobalLocalModel(nn.Module):

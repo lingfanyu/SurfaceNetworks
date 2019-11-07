@@ -19,11 +19,33 @@ import utils.mesh as mesh
 from iglhelpers import e2p, p2e
 from sklearn.externals import joblib
 
+
+"""
+def calc_L2(L):
+    ones = np.ones_like(L.data)
+    adj = sp.sparse.coo_matrix((np.ones_like(L.data), (L.row, L.col)), shape=L.shape)
+    D = 1.0 / np.squeeze(np.sqrt(np.asarray(adj.sum(1))))
+    D[np.isinf(D)] = 0
+    D = sp.sparse.diags(D, 0)
+    L = D * L * D
+    return L * L
+"""
+
+
 def read_npz(seq_names, args):
     with open(seq_names) as fp:
         Xd, Xi = igl.eigen.MatrixXd, igl.eigen.MatrixXi
         eV, eF, eVN = Xd(), Xi(), Xd()
-        igl.readOBJ(seq_names, eV,Xd(),eVN, eF, Xi(), Xi())
+        igl.readOBJ(seq_names, eV,Xd(), eVN, eF, Xi(), Xi())
+
+        """
+        # Upsample
+        for _ in range(args.upsample):
+            eVN = Xd()
+            igl.upsample(eV, eF)
+            igl.per_vertex_normals(eV, eF, eVN)
+        """
+
         new_frame = {}
         npfloat = np.float32
         V, F = e2p(eV), e2p(eF)
@@ -41,7 +63,7 @@ def read_npz(seq_names, args):
             hack = 1
         elif 'hack0' in args.additional_opt:
             hack=0
-        
+
         if 'intrinsic' in args.additional_opt:
             hack = None
         def hackit(Op, h):
@@ -80,6 +102,8 @@ def read_npz(seq_names, args):
             if np.any(np.isnan(L.data)):
                 print(f"warning: {seq_names} nan L")
                 return None
+
+            # L = calc_L2(L)
             new_frame['L'] = util.sp_sparse_to_pt_sparse(L.astype(np.float32))
 
         input_tensors = {}

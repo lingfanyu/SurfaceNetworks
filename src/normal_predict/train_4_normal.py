@@ -61,10 +61,15 @@ parser.add_argument('--half-lr', type=int, default=-1,
 parser.add_argument('--only-forward-test', action="store_true", help="Used to generate results")
 parser.add_argument('--dump-dir', default='/dev/shm/')
 
+parser.add_argument('--hidden', type=int, default=128, help='Number of hidden units')
+
 # Optimizing
 parser.add_argument('--lr', type=float, default=1e-3, help='Learning Rate')
 parser.add_argument('--optimizer', default='adam')
 parser.add_argument('--dense', action='store_true')
+
+# Upsampling
+parser.add_argument('--upsample', type=int, default=0, help='# times to upsample the mesh')
 
 # Experimental Options
 parser.add_argument('--uniform-mesh', action="store_true",
@@ -114,13 +119,13 @@ def main():
         inputs = F.normalize(inputs, p=2, dim=2)
         inner = torch.sum(inputs * targets, dim=2)
         l = 1-inner**2
-        return torch.mean(torch.masked_select(l ,mask.view(l.size(0),l.size(1)).byte()))
+        return torch.mean(torch.masked_select(l ,mask.view(l.size(0),l.size(1)).bool()))
     def mean_angle_deviation(inputs, mask, targets, **kwargs):
         inputs = F.normalize(inputs, p=2, dim=2)
         inner = torch.sum(inputs * targets, dim=2)
         inner = torch.clamp(torch.abs(inner),0,1)
         l = torch.acos(inner)
-        return torch.mean(torch.masked_select(l ,mask.view(l.size(0),l.size(1)).byte()))
+        return torch.mean(torch.masked_select(l ,mask.view(l.size(0),l.size(1)).bool()))
 
 
     input_type_to_dim = {'V':3, 'G':1, 'wks':100, 'cor_V':3, 'N':3, 'curv4':4}
@@ -137,7 +142,8 @@ def main():
     lap_opts = {'layers': args.layer,
                 'bnmode': bnmode,
                 'only_lap': 'only_lap' in args.additional_opt,
-                'nofirstId':False}
+                'nofirstId':False,
+                'num_hidden' : args.hidden}
     if 'avg' in args.model:
         custom_logging("Using AVG")
         model = AvgModel(args.input_dim, args.output_dim, args.layer)
@@ -173,6 +179,7 @@ def main():
 
     if not args.only_forward_test:
         seq_names =  sorted(glob.glob(args.data_path + '**/*.obj', recursive=True))
+        seq_names = seq_names[:args.batch_size * 5]
     else:
         seq_names = []
     custom_logging(f'SEQ:{len(seq_names)}')
@@ -183,7 +190,7 @@ def main():
     else:
         # 80/20 seperation
         sep_length = len(seq_names)//10*8
-        random.shuffle(seq_names)
+        #random.shuffle(seq_names)
         train_seq_names = seq_names[:sep_length]
         test_seq_names = seq_names[sep_length:]
 
@@ -191,6 +198,7 @@ def main():
     sampler.sample_batch.train_id = 0
 
     if args.pre_load:
+        print("start to preload")
         readnpz = functools.partial(sampler.read_npz, args=args) # pickle-able for imap
         torch.multiprocessing.set_sharing_strategy('file_system') # https://github.com/pytorch/pytorch/issues/973
         if not args.only_forward_test:
@@ -212,6 +220,7 @@ def main():
             #                                       ncols=0))
             test_seq_names = [t for t in test_seq_names if t is not None]
         print('Train size:', len(train_seq_names), ' Test size:', len(test_seq_names))
+        print("finish preload")
 
     train_loss = []
     test_loss = []
@@ -220,8 +229,8 @@ def main():
     for epoch in range(args.start_epoch,args.num_epoch):
         if not  args.only_forward_test:
             if sampler.sample_batch.EPOCH_FLAG:
-                random.shuffle(train_seq_names)
-                custom_logging('SHUFFLE')
+                #random.shuffle(train_seq_names)
+                #custom_logging('SHUFFLE')
                 sampler.sample_batch.EPOCH_FLAG=False
 
             model.train()
@@ -230,6 +239,8 @@ def main():
             # Train
             pb = tqdm.trange(args.num_updates, ncols=0)
             for num_up in pb:
+                if num_up == 5:
+                    exit()
                 inputs, targets, mask, DL, _, curr_name, loss_weight = sample_batch_train(train_seq_names)
                 outputs = model(DL, mask, inputs)
 
@@ -253,7 +264,7 @@ def main():
             mad = 0
             test_trials = (int)(np.ceil(len(test_seq_names) / args.batch_size))
             sampler.sample_batch.test_id = 0
-            if not args.no_test:
+            if not args.no_test and epoch % 10 == 9:
                 for _ in tqdm.trange(test_trials, ncols=0):
                     inputs, targets, mask, DL, _, names, loss_weight = sample_batch_test(test_seq_names)
 
