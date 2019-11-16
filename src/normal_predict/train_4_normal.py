@@ -14,16 +14,12 @@ import tqdm
 import functools
 import subprocess
 import multiprocessing
-if __name__ == '__main__':
-    sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-    from utils import timer_utils
-    from utils import utils_pt as util
-    from models import DirDeepModel, LapDeepModel, IdDeepModel, AvgModel, MlpModel, LapMATModel, GatDeepModel, EfficientCascade, GlobalLocalModel
-    import sampler
-else:
-    from ..utils import utils_pt as util
-    from .models import DirDeepModel, LapDeepModel, IdDeepModel, AvgModel, MlpModel, LapMATModel, GatDeepModel, EfficientCascade, GlobalLocalModel
-    from . import sampler
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils import timer_utils
+from utils import utils_pt as util
+from models import LapDeepModel
+import sampler
+from sampler import sample_batch
 
 random.seed(17)
 # Training settings
@@ -89,6 +85,12 @@ parser.add_argument('--debug', action='store_true', help='Not writing to file')
 parser.add_argument('--pre-load', action='store_true', help='Offload computation')
 parser.add_argument('--plot-interval', type=int, default=30, help='Save plotly plot interval')
 
+parser.add_argument('--var-size', action='store_true', help='Variable sized graph')
+parser.add_argument('--shuffle', action="store_true")
+parser.add_argument('--use-threshold', type=int, default=None)
+parser.add_argument('--max-vertices', type=int, default=20000)
+parser.add_argument('--use-schedule', type=str, default=None)
+
 def main():
     args = parser.parse_args()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -110,10 +112,6 @@ def main():
     custom_logging(args)
     custom_logging(subprocess.check_output('hostname'))
     custom_logging(subprocess.check_output('nvidia-smi --query-gpu=name,memory.total --format=csv,noheader', shell=True))
-
-    sample_batch_train = lambda seq: sampler.sample_batch(seq, args, is_fixed=True)
-    sample_batch_test = lambda seq: sampler.sample_batch(seq, args, is_fixed=False)
-    sampler.sample_batch.EPOCH_FLAG = False
 
     def loss_fun(inputs, mask, targets, **kwargs):
         inputs = F.normalize(inputs, p=2, dim=2)
@@ -179,7 +177,6 @@ def main():
 
     if not args.only_forward_test:
         seq_names =  sorted(glob.glob(args.data_path + '**/*.obj', recursive=True))
-        seq_names = seq_names[:args.batch_size * 5]
     else:
         seq_names = []
     custom_logging(f'SEQ:{len(seq_names)}')
@@ -188,14 +185,24 @@ def main():
         train_seq_names = seq_names
         test_seq_names = sorted(glob.glob(f'{args.test_path}/**/*.obj', recursive=True))
     else:
-        # 80/20 seperation
-        sep_length = len(seq_names)//10*8
-        #random.shuffle(seq_names)
-        train_seq_names = seq_names[:sep_length]
-        test_seq_names = seq_names[sep_length:]
+        if args.no_test:
+            train_seq_names = seq_names
+        else:
+            # 80/20 seperation
+            sep_length = len(seq_names)//10*8
+            if args.shuffle:
+                random.shuffle(seq_names)
+            train_seq_names = seq_names[:sep_length]
+            test_seq_names = seq_names[sep_length:]
 
     real_epoch_counter = 0
-    sampler.sample_batch.train_id = 0
+    if not args.var_size and not args.shuffle:
+        train_seq_names = train_seq_names[:args.batch_size * args.num_updates]
+
+    if args.var_size and args.use_schedule:
+        schedule = sampler.load_schedule(args.use_schedule)
+        schedule = schedule[:args.num_updates]
+        train_seq_names = train_seq_names[:schedule[-1][-1] + 1]
 
     if args.pre_load:
         print("start to preload")
@@ -203,6 +210,7 @@ def main():
         torch.multiprocessing.set_sharing_strategy('file_system') # https://github.com/pytorch/pytorch/issues/973
         if not args.only_forward_test:
             if True:
+                #train_seq_names = train_seq_names[:16]
                 train_seq_names = [readnpz(t) for t in tqdm.tqdm(train_seq_names, ncols=0)]
             else:
                 with torch.multiprocessing.Pool(1) as p:
@@ -210,6 +218,8 @@ def main():
                                                     total=len(train_seq_names),
                                                     ncols=0))
             train_seq_names = [t for t in train_seq_names if t is not None]
+
+            #train_seq_names = [s for s in train_seq_names if s["input"].shape[0] < args.max_vertices]
 
 
         if not args.no_test:
@@ -219,34 +229,42 @@ def main():
             #                                       total=len(test_seq_names),
             #                                       ncols=0))
             test_seq_names = [t for t in test_seq_names if t is not None]
+        else:
+            test_seq_names = []
         print('Train size:', len(train_seq_names), ' Test size:', len(test_seq_names))
         print("finish preload")
 
     train_loss = []
     test_loss = []
 
-    sampler.sample_batch.EPOCH_FLAG=True
     for epoch in range(args.start_epoch,args.num_epoch):
         if not  args.only_forward_test:
-            if sampler.sample_batch.EPOCH_FLAG:
-                #random.shuffle(train_seq_names)
-                #custom_logging('SHUFFLE')
-                sampler.sample_batch.EPOCH_FLAG=False
-
             model.train()
             loss_value = 0
             mad = 0
             # Train
-            pb = tqdm.trange(args.num_updates, ncols=0)
-            for num_up in pb:
-                if num_up == 5:
-                    exit()
-                inputs, targets, mask, DL, _, curr_name, loss_weight = sample_batch_train(train_seq_names)
+            if args.use_schedule is None:
+                nbatch = args.num_updates
+                loader = sample_batch(train_seq_names, args, nbatch)
+            else:
+                nbatch = len(schedule)
+                loader = sampler.produce_batch_from_schedule(schedule,
+                                                             train_seq_names)
+                assert(args.pre_load)
+            pb = tqdm.tqdm(loader, total=nbatch, ncols=80)
+            torch.cuda.synchronize()
+            t0 = time.time()
+            for num_up, (data, seq_names) in enumerate(pb):
+                #torch.cuda.synchronize()
+                #t1 = time.time()
+                inputs, targets, mask, DL = data
                 outputs = model(DL, mask, inputs)
 
                 if (torch.isnan(outputs.detach())).any(): assert False, f'NANNNN {curr_name[0]} outputs'
                 loss = loss_fun(outputs, mask, targets)
                 mad += mean_angle_deviation(outputs,mask, targets).item()
+                #torch.cuda.synchronize()
+                #t2 = time.time()
 
                 early_optimizer.zero_grad()
                 loss.backward()
@@ -254,19 +272,24 @@ def main():
                 loss_value += loss.item()
                 if np.isnan(loss_value): assert False, f'NANNNN {curr_name[0]} LOSS'
                 pb.set_postfix(loss=loss_value/(num_up+1), mad = mad/(num_up+1))
+                torch.cuda.synchronize()
+                t3 = time.time()
+                print(inputs.shape[0], inputs.shape[0] * inputs.shape[1], t3 - t0)
+                t0 = t3
 
-            custom_logging("Train {}, loss {}, mad {}, time {}".format(epoch, loss_value / args.num_updates, mad/args.num_updates, pb.last_print_t - pb.start_t))
-            train_loss.append(loss_value / args.num_updates)
+            custom_logging("Train {}, loss {}, mad {}, time {}".format(epoch, loss_value / nbatch, mad/nbatch, pb.last_print_t - pb.start_t))
+            train_loss.append(loss_value / nbatch)
 
         # Evaluate
         with torch.no_grad():
             loss_value = 0
             mad = 0
-            test_trials = (int)(np.ceil(len(test_seq_names) / args.batch_size))
-            sampler.sample_batch.test_id = 0
             if not args.no_test and epoch % 10 == 9:
-                for _ in tqdm.trange(test_trials, ncols=0):
-                    inputs, targets, mask, DL, _, names, loss_weight = sample_batch_test(test_seq_names)
+                test_trials = (int)(np.ceil(len(test_seq_names) / args.batch_size))
+                for data, names in tqdm.tqdm(
+                    sample_batch(test_seq_names, args, test_trials),
+                                 total=test_trials):
+                    inputs, targets, mask, DL = data
 
                     outputs = model(DL, mask, inputs)
                     loss = loss_fun(outputs, mask, targets, loss_weight=loss_weight)
